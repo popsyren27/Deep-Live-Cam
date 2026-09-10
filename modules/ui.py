@@ -258,10 +258,14 @@ def fit_image_to_size(image, width: int, height: int):
     if width is None and height is None or width <= 0 or height <= 0:
         return image
     h, w = image.shape[:2]
+    if (w, h) == (width, height):
+        return image
     ratio_w = width / w
     ratio_h = height / h
     ratio = min(ratio_w, ratio_h)
     new_size = (max(1, int(w * ratio)), max(1, int(h * ratio)))
+    if new_size == (w, h):
+        return image
     return gpu_resize(image, dsize=new_size)
 
 

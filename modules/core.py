@@ -1,8 +1,32 @@
 import os
 import sys
-# single thread doubles cuda performance - needs to be set before torch import
-if any(arg.startswith('--execution-provider') for arg in sys.argv):
-    os.environ['OMP_NUM_THREADS'] = '6'
+
+
+def _configure_thread_env() -> None:
+    """Set thread-pool env vars before torch/onnxruntime import.
+
+    Maxed-out defaults for a 12-core Intel server CPU + DirectML GPU:
+
+    - OMP/MKL/OpenBLAS threads = logical CPUs minus 2 (leaves room for
+      FFmpeg + UI while feeding DML CPU-fallback ops generously).
+    - OMP_WAIT_POLICY=ACTIVE + GOMP_CPU_AFFINITY off: reduces wake-up
+      latency for per-frame inference (~ms scale matters here).
+    - Only sets values the user hasn't already provided.
+    """
+    cpu = os.cpu_count() or 12
+    omp_threads = str(max(4, min(cpu - 2, 22)))
+    os.environ.setdefault('OMP_NUM_THREADS', omp_threads)
+    os.environ.setdefault('MKL_NUM_THREADS', omp_threads)
+    os.environ.setdefault('OPENBLAS_NUM_THREADS', omp_threads)
+    os.environ.setdefault('OMP_WAIT_POLICY', 'ACTIVE')
+    os.environ.setdefault('OMP_DYNAMIC', 'FALSE')
+    # Allow KMP (Intel MKL) to spin briefly instead of sleeping — lower
+    # per-inference latency on server CPUs.
+    os.environ.setdefault('KMP_BLOCKTIME', '0')
+    os.environ.setdefault('KMP_AFFINITY', 'granularity=fine,compact,1,0')
+
+
+_configure_thread_env()
 # reduce tensorflow log level
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import warnings
@@ -53,6 +77,7 @@ def parse_args() -> None:
     program.add_argument('--mouth-mask', help='mask the mouth region', dest='mouth_mask', action='store_true', default=False)
     program.add_argument('--video-encoder', help='adjust output video encoder', dest='video_encoder', default='libx264', choices=['libx264', 'libx265', 'libvpx-vp9'])
     program.add_argument('--video-quality', help='adjust output video quality', dest='video_quality', type=int, default=18, choices=range(52), metavar='[0-51]')
+    program.add_argument('--output-resolution', help='output video size, e.g. 1920x1080, 720p, 4k, or source to keep native size', dest='output_resolution', default='1920x1080')
     program.add_argument('-l', '--lang', help='Ui language', default="en")
     program.add_argument('--live-mirror', help='The live camera display as you see it in the front-facing camera frame', dest='live_mirror', action='store_true', default=False)
     program.add_argument('--live-resizable', help='The live camera frame is resizable', dest='live_resizable', action='store_true', default=False)
@@ -83,6 +108,7 @@ def parse_args() -> None:
     modules.globals.map_faces = args.map_faces
     modules.globals.video_encoder = args.video_encoder
     modules.globals.video_quality = args.video_quality
+    modules.globals.output_resolution = args.output_resolution
     modules.globals.live_mirror = args.live_mirror
     modules.globals.live_resizable = args.live_resizable
     modules.globals.max_memory = args.max_memory
@@ -127,13 +153,30 @@ def encode_execution_providers(execution_providers: List[str]) -> List[str]:
 
 
 def decode_execution_providers(execution_providers: List[str]) -> List[str]:
-    return [provider for provider, encoded_execution_provider in zip(onnxruntime.get_available_providers(), encode_execution_providers(onnxruntime.get_available_providers()))
+    available = onnxruntime.get_available_providers()
+    decoded = [provider for provider, encoded_execution_provider in zip(available, encode_execution_providers(available))
             if any(execution_provider in encoded_execution_provider for execution_provider in execution_providers)]
+    # Always keep a CPU fallback after a GPU provider (DML/CUDA/ROCM/
+    # OpenVINO/CoreML). Without it, ops lacking a DirectML kernel fail
+    # instead of falling back — fatal on Polaris/RX580.
+    if decoded and decoded[0] != 'CPUExecutionProvider' and 'CPUExecutionProvider' in available:
+        if 'CPUExecutionProvider' not in decoded:
+            decoded.append('CPUExecutionProvider')
+    return decoded
 
 
 def suggest_max_memory() -> int:
     if platform.system().lower() == 'darwin':
         return 4
+    # Max out for 32GB-class machines: leave ~4GB for OS/VRAM staging.
+    try:
+        import psutil
+
+        total_gb = psutil.virtual_memory().total // (1024 ** 3)
+        if total_gb >= 8:
+            return int(max(8, min(total_gb - 4, 28)))
+    except Exception:
+        pass
     return 16
 
 
@@ -151,21 +194,34 @@ def suggest_execution_providers() -> List[str]:
 
 
 def suggest_execution_threads() -> int:
-    """Suggest optimal thread count based on hardware and execution provider."""
+    """Suggest optimal worker count based on hardware and execution provider.
+
+    Maxed out for a 12-core Intel server CPU + 8GB DirectML GPU (RX580):
+
+    - DML serialises GPU inference internally (plus ``dml_lock``), so more
+      workers do NOT parallelise inference. But 4-6 workers DO parallelise
+      the CPU-side work around it (imread/imwrite, resize, affine warps,
+      blending) while one worker holds the GPU. 1 worker (old default)
+      starved a 12-core CPU.
+    - CPU fallback ops inside DML sessions use intra_op threads (see
+      ``get_session_options``), which is separate from this worker count.
+    """
     import os
-    
+
     # Get CPU count
-    cpu_count = os.cpu_count() or 4
-    
+    cpu_count = os.cpu_count() or 12
+
     if 'DmlExecutionProvider' in modules.globals.execution_providers:
-        return 1
+        # 12C/24T -> 6 workers; 12C/12T -> 4 workers; cap at 6 so the 8GB
+        # RX580 is never fed more concurrent frames than it can stage.
+        return int(max(4, min(6, (cpu_count // 4) or 4)))
     if 'ROCMExecutionProvider' in modules.globals.execution_providers:
         return 1
     if 'CUDAExecutionProvider' in modules.globals.execution_providers:
         return 2
     if 'OpenVINOExecutionProvider' in modules.globals.execution_providers:
         return 1
-    
+
     # For CPU execution, use most cores but leave some for system
     return max(4, min(cpu_count - 2, 16))
 
@@ -190,6 +246,34 @@ def limit_resources() -> None:
         else:
             import resource
             resource.setrlimit(resource.RLIMIT_DATA, (memory, memory))
+
+
+def apply_runtime_tuning() -> None:
+    """Apply maxed-out CPU-side tuning after providers/threads are known.
+
+    - OpenCV uses its own thread pool (imread/imwrite/resize/warpAffine
+      dominate per-frame CPU time). Default is often capped low; raise it
+      to the worker count on DML, or full CPU count otherwise.
+    - Torch (used only for optional CUDA blending) gets matching threads.
+    """
+    cpu = os.cpu_count() or 12
+    try:
+        import cv2
+
+        if 'DmlExecutionProvider' in modules.globals.execution_providers:
+            cv2.setNumThreads(max(4, min(cpu, 16)))
+        else:
+            cv2.setNumThreads(max(4, min(cpu, 32)))
+    except Exception:
+        pass
+    if HAS_TORCH:
+        try:
+            import torch
+
+            torch.set_num_threads(max(4, min(cpu - 2, 16)))
+            torch.set_num_interop_threads(1)
+        except Exception:
+            pass
 
 
 def release_resources() -> None:
@@ -341,6 +425,7 @@ def run() -> None:
     parse_args()
     if not pre_check():
         return
+    apply_runtime_tuning()
     for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
         if not frame_processor.pre_check():
             return

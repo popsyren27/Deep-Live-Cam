@@ -37,6 +37,7 @@ nsfw_filter: bool = False
 # Video Output Options
 video_encoder: str | None = None
 video_quality: int | None = None # Typically a CRF value or bitrate
+output_resolution: str | None = "1920x1080" # Forced output size as "WIDTHxHEIGHT" (aspect-preserving fit + pad); None = keep source size
 
 # Live Mode Options
 live_mirror: bool = False

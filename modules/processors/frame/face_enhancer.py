@@ -20,8 +20,15 @@ from modules.utilities import (
 )
 
 FACE_ENHANCER = None
-THREAD_SEMAPHORE = threading.Semaphore()
+# Bare Semaphore() == 1 permit serialised ALL enhancer inference — including
+# CUDA/CPU where 2-4 concurrent faces are fine. Size by CPU count; DML
+# GPU work itself is still serialised by dml_lock at the call site.
+THREAD_SEMAPHORE = threading.Semaphore(min(max(2, (os.cpu_count() or 4)), 4))
 THREAD_LOCK = threading.Lock()
+
+
+def _is_dml() -> bool:
+    return any("DmlExecutionProvider" in p for p in modules.globals.execution_providers)
 NAME = "DLC.FACE-ENHANCER"
 MODEL_FILE = "gfpgan-1024.onnx"
 
@@ -352,7 +359,11 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
                         run_inference,
                     )
                     input_tensor = _preprocess_face(aligned_face)
-                    output_tensor = run_inference(session, input_name, input_tensor)
+                    if _is_dml():
+                        with modules.globals.dml_lock:
+                            output_tensor = run_inference(session, input_name, input_tensor)
+                    else:
+                        output_tensor = run_inference(session, input_name, input_tensor)
                     enhanced_bgr = _postprocess_face(output_tensor)
 
                 eh, ew = enhanced_bgr.shape[:2]
@@ -391,8 +402,17 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
 
 
 def process_frame(source_face: Face | None, temp_frame: Frame,
-                   detected_faces=None) -> Frame:
-    """Processes a frame: enhances face if detected."""
+                   detected_faces=None, target_face: Face | None = None) -> Frame:
+    """Processes a frame: enhances face if detected.
+
+    Accepts the in-memory pipeline's ``target_face`` kwarg (pre-detected
+    on a worker thread). Wrapping it as a list also engages the temporal
+    cache, halving inference rate in single-face mode. Previously the
+    kwarg mismatch raised TypeError upstream and every frame paid for a
+    redundant full detection.
+    """
+    if detected_faces is None and target_face is not None:
+        detected_faces = [target_face]
     return enhance_face(temp_frame, detected_faces=detected_faces)
 
 

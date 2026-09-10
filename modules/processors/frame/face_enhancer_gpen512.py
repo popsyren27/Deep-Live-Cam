@@ -16,7 +16,6 @@ from modules.utilities import (
 )
 from modules.processors.frame._onnx_enhancer import (
     create_onnx_session,
-    warmup_session,
     enhance_face_onnx,
 )
 
@@ -81,8 +80,9 @@ def get_enhancer() -> Any:
                     f"Model file not found: {os.path.join(models_dir, MODEL_FILE)}"
                 )
             print(f"{NAME}: Loading ONNX model from {model_path}")
+            # create_onnx_session already warms up (DML shader compile);
+            # a second warmup here would pay that cost twice at startup.
             ENHANCER = create_onnx_session(model_path)
-            warmup_session(ENHANCER)
             print(f"{NAME}: Model loaded successfully.")
     return ENHANCER
 
@@ -100,14 +100,25 @@ def enhance_face(temp_frame: Frame, face: Face) -> Frame:
         return temp_frame
 
 
-def process_frame(source_face: Face | None, temp_frame: Frame, detected_faces=None) -> Frame:
+def process_frame(source_face: Face | None, temp_frame: Frame,
+                  detected_faces=None, target_face: Face | None = None) -> Frame:
+    """Enhance one frame, reusing a pre-detected face when available.
+
+    The in-memory video pipeline passes ``target_face`` (detected on a
+    worker thread while the previous frame was processed). Accepting it
+    here avoids a redundant full detection (~30-80ms on DirectML) per
+    frame — previously the kwarg mismatch raised TypeError upstream and
+    every frame paid for detection twice.
+    """
     if detected_faces:
-        target_face = detected_faces[0]
+        face = detected_faces[0]
+    elif target_face is not None:
+        face = target_face
     else:
-        target_face = get_one_face(temp_frame)
-    if target_face is None:
+        face = get_one_face(temp_frame)
+    if face is None:
         return temp_frame
-    return enhance_face(temp_frame, target_face)
+    return enhance_face(temp_frame, face)
 
 
 def process_frame_v2(temp_frame: Frame) -> Frame:

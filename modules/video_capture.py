@@ -79,6 +79,14 @@ class VideoCapturer:
             if not self.cap or not self.cap.isOpened():
                 raise RuntimeError("Failed to open camera")
 
+            # Minimize internal frame buffering so live mode always processes
+            # the freshest frame instead of draining a stale backlog (lower
+            # end-to-end latency; best effort — some backends ignore it).
+            try:
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+
             # Belt-and-braces: also set via cap.set() for backends that honor
             # post-open changes (MSMF, V4L2). DSHOW ignores these, but the
             # construction params above already handled it.
@@ -96,7 +104,7 @@ class VideoCapturer:
             # even when the camera delivers 60.  Measure empirically by
             # timing a burst of frames.
             reported_fps = self.cap.get(cv2.CAP_PROP_FPS)
-            self.actual_fps = self._measure_fps(warmup=10, sample=30,
+            self.actual_fps = self._measure_fps(warmup=5, sample=20,
                                                 fallback=reported_fps or fps)
 
             print(f"[VideoCapturer] {self.actual_width}x{self.actual_height} "

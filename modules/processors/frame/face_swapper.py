@@ -201,9 +201,18 @@ def pre_check() -> bool:
 
     from modules.model_downloader import ensure_any
 
-    variants = ["inswapper_128.onnx", "inswapper_128_fp16.onnx"]
-    if _HAS_TORCH_CUDA:
-        variants.reverse()
+    # FP16 is only valid on CUDA (Tensor Cores). DML — especially Polaris /
+    # RX580, where FP16 kernels like MaxPool are unsupported (80070057) —
+    # and CPU must get FP32, so order variants by active provider.
+    _providers = modules.globals.execution_providers
+    _want_fp16 = (
+        any("CUDAExecutionProvider" in p for p in _providers)
+        if _providers else _HAS_TORCH_CUDA
+    )
+    variants = (
+        ["inswapper_128_fp16.onnx", "inswapper_128.onnx"]
+        if _want_fp16 else ["inswapper_128.onnx", "inswapper_128_fp16.onnx"]
+    )
     if ensure_any(variants) is None:
         update_status(
             "Could not obtain the inswapper model. Place inswapper_128.onnx in "
@@ -238,20 +247,62 @@ def get_face_swapper() -> Any:
             # Prefer FP16 on GPUs with Tensor Cores (Turing+) — half the
             # memory bandwidth, faster inference.  Fall back to FP32 for
             # older GPUs (e.g. GTX 16xx) where FP16 can produce NaN.
+            # DirectML/Polaris (RX580) has no fast FP16 — force FP32 there
+            # even if a CUDA-capable torch is somehow present.
+            from modules.processors.frame._onnx_enhancer import (
+                CUDA_PROVIDER_OPTIONS,
+                build_provider_config,
+                get_session_options,
+            )
+
+            is_cuda = any(
+                "CUDAExecutionProvider" in p
+                for p in modules.globals.execution_providers
+            )
+            is_dml = any(
+                "DmlExecutionProvider" in p
+                for p in modules.globals.execution_providers
+            )
             fp32_path = os.path.join(models_dir, "inswapper_128.onnx")
             fp16_path = os.path.join(models_dir, "inswapper_128_fp16.onnx")
-            use_fp16 = _HAS_TORCH_CUDA and os.path.exists(fp16_path)
+            # FP16 only on CUDA w/ Tensor Cores. DML (Polaris lacks FP16
+            # kernels — MaxPool etc. fail with 80070057) and CPU require
+            # FP32, even when an fp16 file is already on disk.
+            use_fp16 = _HAS_TORCH_CUDA and is_cuda and os.path.exists(fp16_path)
             if use_fp16:
                 model_path = fp16_path
-            elif os.path.exists(fp32_path):
-                model_path = fp32_path
             else:
-                if not pre_check():
-                    return None
-                model_path = fp16_path if os.path.exists(fp16_path) else fp32_path
-                if not os.path.exists(model_path):
-                    update_status(f"No inswapper model found in {models_dir}.", NAME)
-                    return None
+                if not os.path.exists(fp32_path):
+                    # Never silently run a present-but-wrong-precision fp16
+                    # on DML/CPU: fetch FP32 (~554MB, one-time) instead.
+                    print(
+                        f"[{NAME}] FP32 model missing for "
+                        f"{'DirectML' if is_dml else 'this provider'} — "
+                        "downloading inswapper_128.onnx (FP16 is CUDA-only)."
+                    )
+                    from modules.model_downloader import ensure_model
+
+                    ensure_model("inswapper_128.onnx")
+                if os.path.exists(fp32_path):
+                    model_path = fp32_path
+                else:
+                    if not pre_check():
+                        return None
+                    if os.path.exists(fp32_path):
+                        model_path = fp32_path
+                    elif os.path.exists(fp16_path):
+                        if not is_cuda:
+                            update_status(
+                                "WARNING: only the FP16 model is available and "
+                                "FP16 kernels are unsupported on this provider — "
+                                "expect DML errors. Delete "
+                                f"{fp16_path} and restart to re-download FP32.",
+                                NAME,
+                            )
+                        model_path = fp16_path
+                    else:
+                        update_status(f"No inswapper model found in {models_dir}.", NAME)
+                        return None
             # On Apple Silicon, rewrite Pad(reflect) → Slice+Concat so
             # CoreML can run the entire model in a single partition on
             # the Neural Engine instead of bouncing between CPU and ANE.
@@ -276,17 +327,40 @@ def get_face_swapper() -> Any:
                             }
                         ))
                     elif p == "CUDAExecutionProvider":
-                        # Use bare provider — ONNX Runtime defaults are
-                        # fastest on modern GPUs (Blackwell/sm_120).
-                        providers_config.append(p)
+                        providers_config.append(
+                            ("CUDAExecutionProvider", dict(CUDA_PROVIDER_OPTIONS))
+                        )
                     elif p == "OpenVINOExecutionProvider":
                         providers_config.append(OPENVINO_PROVIDER_CONFIG)
                     else:
+                        # DmlExecutionProvider: bare string (no options).
                         providers_config.append(p)
+                # Ensure CPU fallback + tuned session options. On RX580 this
+                # is the difference between failing on unsupported ops and
+                # transparently running them on the 12-core CPU.
+                providers_config = build_provider_config(providers_config)
+                sess_options = get_session_options(providers_config)
                 FACE_SWAPPER = insightface.model_zoo.get_model(
                     model_path,
                     providers=providers_config,
+                    sess_options=sess_options,
                 )
+                # Warm up DML shader compilation now (static 128x128 +
+                # 512-embedding shapes) so live/video doesn't hitch.
+                if is_dml:
+                    try:
+                        import numpy as _np
+
+                        _blob = _np.zeros((1, 3, 128, 128), dtype=_np.float32)
+                        _lat = _np.zeros((1, 512), dtype=_np.float32)
+                        _sess = getattr(FACE_SWAPPER, 'session', None)
+                        if _sess is not None:
+                            _names = [i.name for i in _sess.get_inputs()]
+                            if len(_names) >= 2:
+                                with modules.globals.dml_lock:
+                                    _sess.run(None, {_names[0]: _blob, _names[1]: _lat})
+                    except Exception as _e:
+                        print(f"[{NAME}] DML warmup skipped (non-fatal): {_e}")
                 # Set up CUDA graph session for faster inference
                 if _HAS_TORCH_CUDA and any(
                     p == "CUDAExecutionProvider" or
@@ -395,8 +469,19 @@ def _init_cuda_graph_session(model_path: str, swapper):
     """
     import onnxruntime as ort
     try:
-        providers = [('CUDAExecutionProvider', {'enable_cuda_graph': '1'})]
-        sess = ort.InferenceSession(model_path, providers=providers)
+        from modules.processors.frame._onnx_enhancer import (
+            CUDA_PROVIDER_OPTIONS as _CUDA_OPTS,
+            get_session_options as _get_sess_opts,
+        )
+
+        _cuda_opts = dict(_CUDA_OPTS)
+        _cuda_opts['enable_cuda_graph'] = '1'
+        providers = [('CUDAExecutionProvider', _cuda_opts)]
+        sess = ort.InferenceSession(
+            model_path,
+            sess_options=_get_sess_opts(providers),
+            providers=providers,
+        )
 
         # Pre-allocate GPU buffers with correct shapes
         inp_shape = (1, 3, swapper.input_size[1], swapper.input_size[0])
@@ -541,6 +626,10 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
 
     if temp_frame.dtype != np.uint8:
         temp_frame = np.clip(temp_frame, 0, 255).astype(np.uint8)
+    # original_frame was copied above from the possibly non-uint8 input —
+    # normalize it too so every downstream astype (full-frame copies) can go.
+    if original_frame.dtype != np.uint8:
+        original_frame = np.clip(original_frame, 0, 255).astype(np.uint8)
 
     try:
         if not temp_frame.flags['C_CONTIGUOUS']:
@@ -563,12 +652,10 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         if not isinstance(bgr_fake, np.ndarray):
             return original_frame
 
-        # Pass a dummy aimg with correct shape — _fast_paste_back only uses aimg.shape
-        # to create the white mask. Avoids redundant norm_crop2 (~0.6ms).
-        _face_size = face_swapper.input_size[0]
-        _aimg_dummy = np.empty((_face_size, _face_size, 3), dtype=np.uint8)
-
-        swapped_frame = _fast_paste_back(temp_frame, bgr_fake, _aimg_dummy, M)
+        # bgr_fake IS the aligned square (input_size x input_size) and
+        # _fast_paste_back only reads aimg.shape — pass it directly instead
+        # of allocating a dummy (and insightface's norm_crop2, ~0.6ms).
+        swapped_frame = _fast_paste_back(temp_frame, bgr_fake, bgr_fake, M)
 
     except Exception as e:
         print(f"Error during face swap: {e}")
@@ -609,13 +696,15 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
             swapped_frame, original_frame, target_face, M, bgr_fake
         )
 
-    # Apply opacity blend between the original frame and the swapped frame
+    # Apply opacity blend between the original frame and the swapped frame.
+    # Both are guaranteed uint8 here (normalized above; paste-back preserves
+    # dtype), and addWeighted saturates natively — the old .astype() calls
+    # were full-frame no-op copies (~1ms @720p, ~2.4ms @1080p each).
     if opacity >= 1.0:
-        return swapped_frame.astype(np.uint8)
+        return swapped_frame
 
     # Blend the original_frame with the (potentially mouth-masked) swapped_frame
-    final_swapped_frame = gpu_add_weighted(original_frame.astype(np.uint8), 1 - opacity, swapped_frame.astype(np.uint8), opacity, 0)
-    return final_swapped_frame.astype(np.uint8)
+    return gpu_add_weighted(original_frame, 1 - opacity, swapped_frame, opacity, 0)
 
 
 # --- START: Mac M1-M5 Optimized Face Detection ---
@@ -661,18 +750,20 @@ def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.nda
 
     sharpness_value = getattr(modules.globals, "sharpness", 0.0)
     enable_interpolation = getattr(modules.globals, "enable_interpolation", False)
+    interpolation_weight = getattr(modules.globals, "interpolation_weight", 0.2)
 
     # Skip copy when no post-processing is active
     if sharpness_value <= 0.0 and not enable_interpolation:
         PREVIOUS_FRAME_RESULT = None
         return current_frame
 
-    processed_frame = current_frame.copy()
-
-    # 1. Apply Sharpening (if enabled) with optimized kernel for Apple Silicon
-    sharpness_value = getattr(modules.globals, "sharpness", 0.0)
-    if sharpness_value > 0.0 and swapped_face_bboxes:
+    # Only copy when sharpening mutates in place; interpolation's
+    # addWeighted allocates its own output, so aliasing is free there.
+    sharpen_active = sharpness_value > 0.0 and bool(swapped_face_bboxes)
+    if sharpen_active:
+        processed_frame = current_frame.copy()
         height, width = processed_frame.shape[:2]
+        owned = True
         for bbox in swapped_face_bboxes:
             # Ensure bbox is iterable and has 4 elements
             if not hasattr(bbox, '__iter__') or len(bbox) != 4:
@@ -702,38 +793,39 @@ def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.nda
                 processed_frame[y1:y2, x1:x2] = sharpened_region
             except cv2.error:
                 pass
+    else:
+        # Interpolation-only path: alias the caller's frame. addWeighted
+        # below allocates fresh output, so no copy is needed here.
+        processed_frame = current_frame
+        owned = False
 
 
-    # 2. Apply Interpolation (if enabled)
-    enable_interpolation = getattr(modules.globals, "enable_interpolation", False)
-    interpolation_weight = getattr(modules.globals, "interpolation_weight", 0.2)
-
+    # 2. Apply Interpolation (if enabled; weight read once above)
     final_frame = processed_frame # Start with the current (potentially sharpened) frame
 
     if enable_interpolation and 0 < interpolation_weight < 1:
         if PREVIOUS_FRAME_RESULT is not None and PREVIOUS_FRAME_RESULT.shape == processed_frame.shape and PREVIOUS_FRAME_RESULT.dtype == processed_frame.dtype:
             # Perform interpolation
             try:
+                 # addWeighted saturates natively to uint8 — the old
+                 # clip+astype was a full-frame no-op pass (~3ms @720p).
                  final_frame = gpu_add_weighted(
                     PREVIOUS_FRAME_RESULT, 1.0 - interpolation_weight,
                     processed_frame, interpolation_weight,
                     0
                  )
-                 # Ensure final frame is uint8
-                 final_frame = np.clip(final_frame, 0, 255).astype(np.uint8)
             except cv2.error as interp_e:
                  # print(f"Warning: OpenCV error during interpolation: {interp_e}") # Debug
                  final_frame = processed_frame # Use current frame if interpolation fails
                  PREVIOUS_FRAME_RESULT = None # Reset state if error occurs
-
-            # Update the state for the next frame *with the interpolated result*
-            PREVIOUS_FRAME_RESULT = final_frame.copy()
+            else:
+                # addWeighted returned a fresh array nobody else owns —
+                # keep it directly instead of copying again.
+                PREVIOUS_FRAME_RESULT = final_frame
         else:
-            # If previous frame invalid or doesn't match, use current frame and update state
-            if PREVIOUS_FRAME_RESULT is not None and PREVIOUS_FRAME_RESULT.shape != processed_frame.shape:
-                # print("Info: Frame shape changed, resetting interpolation state.") # Debug
-                pass
-            PREVIOUS_FRAME_RESULT = processed_frame.copy()
+            # If previous frame invalid or doesn't match, use current frame
+            # and update state. Copy only when aliasing the caller's frame.
+            PREVIOUS_FRAME_RESULT = processed_frame if owned else processed_frame.copy()
     else:
          # Interpolation is off or weight is invalid — no need to cache
          PREVIOUS_FRAME_RESULT = None
@@ -909,6 +1001,36 @@ def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
     return final_frame
 
 
+# Source-face cache for the disk pipeline. multi_process_frame submits
+# process_frames() per single frame, so without this the source image is
+# re-read and re-analyzed (full det+rec, ~20-50ms on DML) for EVERY frame.
+# Keyed by path + mtime so swapping the source mid-run still refreshes.
+_SOURCE_FACE_CACHE: dict = {'path': None, 'mtime': 0.0, 'face': None}
+_SOURCE_FACE_CACHE_LOCK = threading.Lock()
+
+
+def _get_cached_source_face(source_path: str) -> Any:
+    """Return the analyzed source face, loading it once per file version."""
+    if not source_path or not os.path.exists(source_path):
+        return None
+    try:
+        mtime = os.path.getmtime(source_path)
+    except OSError:
+        return None
+    with _SOURCE_FACE_CACHE_LOCK:
+        if (_SOURCE_FACE_CACHE['path'] == source_path
+                and _SOURCE_FACE_CACHE['mtime'] == mtime):
+            return _SOURCE_FACE_CACHE['face']
+    source_img = imread_unicode(source_path)
+    if source_img is None:
+        return None
+    face = get_one_face(source_img)
+    del source_img
+    with _SOURCE_FACE_CACHE_LOCK:
+        _SOURCE_FACE_CACHE.update(path=source_path, mtime=mtime, face=face)
+    return face
+
+
 def process_frames(
     source_path: str, temp_frame_paths: List[str], progress: Any = None
 ) -> None:
@@ -923,23 +1045,19 @@ def process_frames(
     source_face = None # Initialize source_face
 
     # --- Pre-load source face only if needed (Simple Mode: map_faces=False) ---
+    # Cached per file version: the disk pipeline calls this once per frame,
+    # and re-running detection on the identical source image each time cost
+    # a full det+rec per frame.
     if not use_v2:
         if not source_path or not os.path.exists(source_path):
             update_status(f"Error: Source path invalid or not provided for simple mode: {source_path}", NAME)
             # Log the error but allow proceeding; subsequent check will stop processing.
         else:
             try:
-                source_img = imread_unicode(source_path)
-                if source_img is None:
-                    # Specific error for file reading failure
-                    update_status(f"Error reading source image file {source_path}. Please check the path and file integrity.", NAME)
-                else:
-                    source_face = get_one_face(source_img)
-                    if source_face is None:
-                        # Specific message for no face detected after successful read
-                        update_status(f"Warning: Successfully read source image {source_path}, but no face was detected. Swaps will be skipped.", NAME)
-                    # Free memory immediately after extracting face
-                    del source_img
+                source_face = _get_cached_source_face(source_path)
+                if source_face is None:
+                    # Specific message for no face detected after successful read
+                    update_status(f"Warning: No usable face in source image {source_path}. Swaps will be skipped.", NAME)
             except Exception as e:
                 # Print the specific exception caught
                 import traceback

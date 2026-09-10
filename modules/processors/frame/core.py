@@ -188,17 +188,19 @@ def process_video_in_memory(source_path: str, target_path: str, fps: float) -> b
             encoder = 'h264_amf'
             is_hw_encoder = True
             encoder_options = [
-                '-quality', 'quality', '-rc', 'vbr_latency',
+                '-quality', 'quality', '-rc', 'cqp',
                 '-qp_i', str(modules.globals.video_quality),
                 '-qp_p', str(modules.globals.video_quality),
+                '-qp_b', str(modules.globals.video_quality),
             ]
         elif encoder == 'libx265':
             encoder = 'hevc_amf'
             is_hw_encoder = True
             encoder_options = [
-                '-quality', 'quality', '-rc', 'vbr_latency',
+                '-quality', 'quality', '-rc', 'cqp',
                 '-qp_i', str(modules.globals.video_quality),
                 '-qp_p', str(modules.globals.video_quality),
+                '-qp_b', str(modules.globals.video_quality),
             ]
 
     if not is_hw_encoder:
@@ -282,6 +284,10 @@ def _run_pipe_pipeline(
     ]
 
     # --- Writer: encode raw BGR24 from stdin ---
+    # Output resolution: frames arrive at native size; scale/pad to
+    # output_resolution (default 1920x1080) in-filter on the encoder side.
+    from modules.utilities import build_output_vf
+
     writer_cmd = [
         'ffmpeg', '-hide_banner',
         '-f', 'rawvideo',
@@ -295,7 +301,7 @@ def _run_pipe_pipeline(
     writer_cmd.extend([
         '-pix_fmt', 'yuv420p',
         '-movflags', '+faststart',
-        '-vf', 'colorspace=bt709:iall=bt601-6-625:fast=1',
+        '-vf', build_output_vf(width, height),
         '-v', 'error',
         '-y', temp_output_path,
     ])
@@ -373,7 +379,14 @@ def _run_pipe_pipeline(
                     except TypeError:
                         frame = fp.process_frame(source_face, frame)
 
-                writer.stdin.write(frame.tobytes())
+                # Zero-copy pipe feed: ndarray supports the buffer protocol,
+                # saving a full-frame tobytes() copy (~0.8ms @720p) per frame.
+                if not frame.flags['C_CONTIGUOUS']:
+                    frame = np.ascontiguousarray(frame)
+                try:
+                    writer.stdin.write(frame)
+                except Exception:
+                    writer.stdin.write(frame.tobytes())
                 processed_count += 1
                 progress.update(1)
 

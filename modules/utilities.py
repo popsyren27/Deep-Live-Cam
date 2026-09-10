@@ -18,12 +18,21 @@ TEMP_DIRECTORY = "temp"
 
 def run_ffmpeg(args: List[str]) -> bool:
     """Run ffmpeg with hardware acceleration and optimized settings."""
+    # Max out decode threads for the 12-core CPU: execution_threads counts
+    # GPU-serialised inference workers (4-6 on DML), but FFmpeg decode can
+    # usefully take more. Give it at least cpu-2 unless explicitly capped.
+    import os as _os
+
+    _cpu = _os.cpu_count() or 12
+    _threads = modules.globals.execution_threads or 0
+    if 'DmlExecutionProvider' in modules.globals.execution_providers:
+        _threads = max(_threads, min(_cpu - 2, 16), 8)
     commands = [
         "ffmpeg",
         "-hide_banner",
-        "-hwaccel", "auto",  # Auto-detect hardware acceleration
+        "-hwaccel", "auto",  # Auto-detect hardware acceleration (d3d11va on AMD/Windows)
         "-hwaccel_output_format", "auto",  # Use hardware format when possible
-        "-threads", str(modules.globals.execution_threads or 0),  # 0 = auto-detect optimal thread count
+        "-threads", str(_threads or 0),  # 0 = auto-detect optimal thread count
         "-loglevel", modules.globals.log_level,
     ]
     commands.extend(args)
@@ -109,23 +118,27 @@ def create_video(target_path: str, fps: float = 30.0) -> bool:
                 "-b:v", "0",
             ]
     elif 'DmlExecutionProvider' in modules.globals.execution_providers:
-        # AMD/Intel GPU encoding (DirectML on Windows)
+        # AMD AMF encoding (RX580/Polaris via AMF). Max quality for file
+        # output: CQP mode with matched I/P/B QP + high-quality preset.
+        # (vbr_latency is a streaming mode — lower efficiency for files.)
         if encoder == 'libx264':
             # Try AMD AMF encoder
             encoder = 'h264_amf'
             encoder_options = [
-                "-quality", "quality",  # Quality mode
-                "-rc", "vbr_latency",
+                "-quality", "quality",
+                "-rc", "cqp",
                 "-qp_i", str(modules.globals.video_quality),
                 "-qp_p", str(modules.globals.video_quality),
+                "-qp_b", str(modules.globals.video_quality),
             ]
         elif encoder == 'libx265':
             encoder = 'hevc_amf'
             encoder_options = [
                 "-quality", "quality",
-                "-rc", "vbr_latency",
+                "-rc", "cqp",
                 "-qp_i", str(modules.globals.video_quality),
                 "-qp_p", str(modules.globals.video_quality),
+                "-qp_b", str(modules.globals.video_quality),
             ]
     else:
         # CPU encoding with optimized settings
@@ -158,18 +171,27 @@ def create_video(target_path: str, fps: float = 30.0) -> bool:
     # Add encoder-specific options
     ffmpeg_args.extend(encoder_options)
     
+    # Output resolution: scale/pad to output_resolution (default 1920x1080)
+    # via ffmpeg (GPU-side, no extra PNG rewrite). Falls back to plain
+    # colorspace conversion if the source size can't be probed.
+    try:
+        _src_w, _src_h = get_video_dimensions(target_path)
+        _vf = build_output_vf(_src_w, _src_h)
+    except Exception:
+        _vf = "colorspace=bt709:iall=bt601-6-625:fast=1"
+
     # Add common options
     ffmpeg_args.extend([
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",  # Enable fast start for web playback
-        "-vf", "colorspace=bt709:iall=bt601-6-625:fast=1",
+        "-vf", _vf,
         "-y",
         temp_output_path,
     ])
-    
+
     # Try with hardware encoder first, fallback to software if it fails
     success = run_ffmpeg(ffmpeg_args)
-    
+
     if not success and encoder in ['h264_nvenc', 'hevc_nvenc', 'h264_amf', 'hevc_amf']:
         # Fallback to software encoding
         print(f"Hardware encoding with {encoder} failed, falling back to software encoding...")
@@ -182,7 +204,7 @@ def create_video(target_path: str, fps: float = 30.0) -> bool:
             "-crf", str(modules.globals.video_quality),
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
-            "-vf", "colorspace=bt709:iall=bt601-6-625:fast=1",
+            "-vf", _vf,
             "-y",
             temp_output_path,
         ]
@@ -333,6 +355,84 @@ def get_video_dimensions(target_path: str) -> tuple:
     output = subprocess.check_output(command).decode().strip()
     width, height = map(int, output.split("x"))
     return width, height
+
+
+_RESOLUTION_ALIASES = {
+    "720p": (1280, 720),
+    "1080p": (1920, 1080),
+    "1440p": (2560, 1440),
+    "4k": (3840, 2160),
+    "2160p": (3840, 2160),
+}
+
+
+def parse_output_resolution(value: str | None) -> tuple | None:
+    """Parse an output-resolution string into (width, height).
+
+    Accepts ``WIDTHxHEIGHT`` (e.g. ``1920x1080``), ``720p``/``1080p``/
+    ``1440p``/``4k``/``2160p`` aliases, or ``source``/``none``/empty for
+    "keep source size" (returns None). Dimensions are rounded down to even
+    (required by yuv420p).
+    """
+    if value is None:
+        return None
+    text = value.strip().lower()
+    if text in ("", "source", "none", "native", "keep"):
+        return None
+    if text in _RESOLUTION_ALIASES:
+        return _RESOLUTION_ALIASES[text]
+    parts = text.replace("×", "x").split("x")
+    if len(parts) != 2:
+        print(f"[DLC.CORE] Invalid --output-resolution '{value}', keeping source size.")
+        return None
+    try:
+        width, height = int(parts[0]), int(parts[1])
+    except ValueError:
+        print(f"[DLC.CORE] Invalid --output-resolution '{value}', keeping source size.")
+        return None
+    if width <= 0 or height <= 0:
+        print(f"[DLC.CORE] Invalid --output-resolution '{value}', keeping source size.")
+        return None
+    # yuv420p needs even dimensions.
+    width -= width % 2
+    height -= height % 2
+    return (width, height)
+
+
+def get_output_scale_filter(src_width: int, src_height: int) -> str | None:
+    """Return an ffmpeg scale/pad filter chain for the target resolution.
+
+    Fits the source inside ``output_resolution`` preserving aspect ratio
+    (letterbox/pillarbox pad) so faces are never stretched. Returns None
+    when no scaling is configured or the source already matches.
+    """
+    target = parse_output_resolution(modules.globals.output_resolution)
+    if target is None:
+        return None
+    target_width, target_height = target
+    if (src_width, src_height) == (target_width, target_height):
+        return None
+    # Fit inside target, fix any odd dimension from the aspect fit
+    # (yuv420p-safe), then pad out to the exact target size.
+    return (
+        f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+        f"scale=trunc(iw/2)*2:trunc(ih/2)*2,"
+        f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2"
+    )
+
+
+def build_output_vf(src_width: int, src_height: int) -> str:
+    """Full -vf value: optional 1080p scale/pad + colorspace conversion."""
+    base = "colorspace=bt709:iall=bt601-6-625:fast=1"
+    scale = get_output_scale_filter(src_width, src_height)
+    vf = f"{scale},{base}" if scale else base
+    target = parse_output_resolution(modules.globals.output_resolution)
+    if scale and target is not None:
+        print(
+            f"[DLC.CORE] Scaling output {src_width}x{src_height} -> "
+            f"{target[0]}x{target[1]} (aspect-preserving)."
+        )
+    return vf
 
 
 def estimate_frame_count(target_path: str, fps: float = None) -> int:

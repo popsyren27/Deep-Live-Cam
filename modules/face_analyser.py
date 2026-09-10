@@ -28,18 +28,43 @@ def get_face_analyser() -> Any:
             if FACE_ANALYSER is None:
                 from modules.processors.frame._onnx_enhancer import (
                     build_provider_config,
+                    get_session_options,
+                    warmup_session,
                 )
                 from modules.model_downloader import ensure_insightface_pack
 
                 ensure_insightface_pack('buffalo_l')
                 providers = build_provider_config()
+                # Tuned SessionOptions are forwarded by insightface to every
+                # model (det/rec/landmark) via PickableInferenceSession.
+                # On DML this enables ORT_ENABLE_ALL + high intra_op threads
+                # for CPU-fallback ops + sequential execution for the 8GB
+                # RX580.
+                sess_options = get_session_options(providers)
                 FACE_ANALYSER = insightface.app.FaceAnalysis(
                     name='buffalo_l',
                     providers=providers,
+                    sess_options=sess_options,
                     allowed_modules=['detection', 'recognition', 'landmark_2d_106']
                 )
                 FACE_ANALYSER.prepare(ctx_id=0, det_size=DET_SIZE)
                 _optimize_det_model(FACE_ANALYSER, providers)
+                # Warm up DML shaders now (first inference compiles, ~seconds
+                # on Polaris). Avoids the first-frame hitch in live/video.
+                try:
+                    import numpy as _np
+
+                    _dummy = _np.zeros((640, 640, 3), dtype=_np.uint8)
+                    _analyse_faces(_dummy)
+                    for _m in getattr(FACE_ANALYSER, 'models', {}).values():
+                        _sess = getattr(_m, 'session', None)
+                        if _sess is not None:
+                            try:
+                                warmup_session(_sess)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
     return FACE_ANALYSER
 
 
@@ -65,10 +90,9 @@ def _optimize_det_model(fa: Any, providers) -> None:
         return
 
     import onnxruntime
-    session_options = onnxruntime.SessionOptions()
-    session_options.graph_optimization_level = (
-        onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-    )
+    from modules.processors.frame._onnx_enhancer import get_session_options
+
+    session_options = get_session_options(providers)
 
     # Route detection to GPU shader cores (CPUAndGPU) instead of ANE.
     # This lets detection run concurrently with the swap model on the
@@ -114,6 +138,11 @@ def _analyse_faces(frame: Frame) -> list:
     landmark_2d_106 model when only face_swapper is active (saves ~1ms
     per face and avoids an unnecessary ONNX session call).
     """
+    if frame is None:
+        # imread_unicode returns None for missing/unreadable images (e.g.
+        # source path not set yet in the UI). InsightFace would crash with
+        # AttributeError deep inside detect() — return "no faces" instead.
+        return []
     fa = get_face_analyser()
 
     bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric="default")
@@ -169,6 +198,8 @@ def detect_one_face_fast(frame: Frame) -> Any:
     Returns a Face with bbox, kps, det_score (enough for face swap).
     ~10ms vs ~16ms for full get_one_face() at 1080p.
     """
+    if frame is None:
+        return None
     from insightface.app.common import Face
     fa = get_face_analyser()
     bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric='default')
@@ -180,6 +211,8 @@ def detect_one_face_fast(frame: Frame) -> Any:
 
 def detect_many_faces_fast(frame: Frame) -> Any:
     """Detection-only multi-face — skips landmark and recognition."""
+    if frame is None:
+        return None
     from insightface.app.common import Face
     fa = get_face_analyser()
     bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric='default')
